@@ -32,13 +32,35 @@ pub fn Serializer(comptime options: SerializerOptions) type {
 
         /// Helper type to keep track of the number of bytes written during serialization.
         const Written = struct {
-            to_value: usize,
+            to_value: usize = 0,
+            to_trailer: usize = 0,
+
+            fn total(self: *const Written) usize {
+                return self.to_value + self.to_trailer;
+            }
         };
 
         alloc: std.mem.Allocator,
 
-        /// The bytes that'll be re-interpreted as `Serialized(T)` upon deserialization.
+        /// The bytes that'll be re-interpreted as `SerializedRep(T)` upon deserialization.
         value: std.ArrayList(u8),
+
+        /// The trailer bytes, e.g. extra bytes that can be referenced by relative pointers.
+        trailer: std.ArrayList(u8),
+
+        /// The list of relative pointers within either `value` or `trailer` that need to be adjusted
+        /// before writing out the final serialized blob. Specifically, we don't know the final offsets
+        /// until serialization is fully complete.
+        ///
+        /// Calling `fixRelPtrs` will peform the adjustment in-place, and clear this list. It must be
+        /// called after all serialization is done, but before writing out the final blob.
+        unfixed_relptrs: std.ArrayList(UnfixedRelPtr),
+
+        /// Helper type to track an unfixed relative pointer that needs adjustment.
+        const UnfixedRelPtr = struct {
+            offset: u32,
+            location: enum { value, trailer },
+        };
 
         /// Initialize a new Serializer, which can be reused multiple times to serialize values.
         /// Maintains in-memory buffers to avoid repeated allocations.
@@ -46,18 +68,24 @@ pub fn Serializer(comptime options: SerializerOptions) type {
             return .{
                 .alloc = alloc,
                 .value = .{},
+                .trailer = .{},
+                .unfixed_relptrs = .{},
             };
         }
 
         fn deinit(self: *Self) void {
             self.value.deinit(self.alloc);
+            self.trailer.deinit(self.alloc);
+            self.unfixed_relptrs.deinit(self.alloc);
             self.* = undefined;
         }
 
         /// Returns whether their is any in-memory state currently stored in this serializer.
         /// In general, this will be true if `serialize` has been called and `reset` has not been called since.
         fn empty(self: *const Self) bool {
-            return self.value.items.len == 0;
+            return self.value.items.len == 0 and
+                self.trailer.items.len == 0 and
+                self.unfixed_relptrs.items.len == 0;
         }
 
         /// Clears the in-memory state of this serializer, allowing it to be reused.
@@ -65,6 +93,8 @@ pub fn Serializer(comptime options: SerializerOptions) type {
         /// To free all memory, call `deinit`.
         fn reset(self: *Self) void {
             self.value.clearRetainingCapacity();
+            self.trailer.clearRetainingCapacity();
+            self.unfixed_relptrs.clearRetainingCapacity();
             assert(self.empty());
         }
 
@@ -77,12 +107,12 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                     var buf: [@sizeOf(T)]u8 = undefined;
                     encodeFixed(options.endianness, &buf, value);
                     try self.value.appendSlice(self.alloc, &buf);
-                    break :blk .{ .to_value = buf.len };
+                    break :blk .{ .to_value = buf.len, .to_trailer = 0 };
                 },
                 .bool => blk: {
                     const byte: u8 = if (value) 1 else 0;
                     try self.value.append(self.alloc, byte);
-                    break :blk .{ .to_value = 1 };
+                    break :blk .{ .to_value = 1, .to_trailer = 0 };
                 },
                 .@"enum" => |info| blk: {
                     const aligned_type = std.math.ByteAlignedInt(info.tag_type);
@@ -90,9 +120,9 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                     break :blk self.serialize(tag);
                 },
                 .@"struct" => |info| blk: {
-                    var written: Written = .{ .to_value = 0 };
+                    var written: Written = .{};
                     inline for (info.fields) |field| {
-                        const field_alignment = @alignOf(Serialized(field.type));
+                        const field_alignment = @alignOf(SerializedRep(field.type));
                         const padding_rem = written.to_value % field_alignment;
                         if (padding_rem > 0) {
                             const padding = field_alignment - padding_rem;
@@ -101,8 +131,9 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                         }
                         const w = try self.serialize(@field(value, field.name));
                         written.to_value += w.to_value;
+                        written.to_trailer += w.to_trailer;
                     }
-                    const struct_alignment = @alignOf(Serialized(T));
+                    const struct_alignment = @alignOf(SerializedRep(T));
                     const final_padding_rem = written.to_value % struct_alignment;
                     if (final_padding_rem > 0) {
                         const final_padding = struct_alignment - final_padding_rem;
@@ -111,14 +142,87 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                     }
                     break :blk written;
                 },
+                .pointer => |info| switch (info.size) {
+                    .one => blk: {
+                        // Pointers are tricky - they emit a `u32` offset into the value section,
+                        // and the actual data is appended to the trailer section.
+
+                        // Serialize the inner value recursively. Notably, this will write the value
+                        // data to the wrong section, we'll fix that below. We do it this way to properly
+                        // handle nested pointers.
+                        const original_unfixed_relptr_len = self.unfixed_relptrs.items.len;
+                        var written = try self.serialize(value.*);
+
+                        // Fix the alignment, e.g. make sure the trailer is padded appropriately
+                        // s.t. that the inner value is properly aligned.
+                        const inner_alignment = @alignOf(SerializedRep(info.child));
+                        const aligned_trailer_len = std.mem.alignForward(usize, self.trailer.items.len, inner_alignment);
+                        const trailer_padding = aligned_trailer_len - self.trailer.items.len;
+                        if (trailer_padding > 0) {
+                            try self.trailer.appendNTimes(self.alloc, 0, trailer_padding);
+                            written.to_trailer += trailer_padding;
+                        }
+
+                        // Move the inner value bytes from the value section to the trailer section.
+                        const original_value_length = self.value.items.len - written.to_value;
+                        const inner_written_bytes = self.value.items[original_value_length..];
+                        const trailer_offset = @as(u32, @intCast(self.trailer.items.len));
+                        try self.trailer.appendSlice(self.alloc, inner_written_bytes);
+                        self.value.resize(self.alloc, original_value_length) catch unreachable; // Truncation
+                        written.to_trailer += written.to_value;
+
+                        // For any relative pointers in the inner value, we need to adjust their location
+                        // to be in the trailer section now.
+                        const new_unfixed_relptr_len = self.unfixed_relptrs.items.len;
+                        for (original_unfixed_relptr_len..new_unfixed_relptr_len) |i| {
+                            self.unfixed_relptrs.items[i].offset -= @as(u32, @intCast(original_value_length));
+                            self.unfixed_relptrs.items[i].offset += trailer_offset;
+                            self.unfixed_relptrs.items[i].location = .trailer;
+                        }
+
+                        // Write the offset to the inner value in the trailer.
+                        const rel_ptr_offset = @as(u32, @intCast(self.value.items.len));
+                        const rel_ptr_w = try self.serialize(trailer_offset);
+                        written.to_value = rel_ptr_w.to_value;
+                        assert(rel_ptr_w.to_trailer == 0);
+
+                        // The relative pointer needs to be adjusted when writing out the final blob.
+                        try self.unfixed_relptrs.append(self.alloc, .{
+                            .offset = rel_ptr_offset,
+                            .location = .value,
+                        });
+
+                        break :blk written;
+                    },
+                    else => @compileError("unsupported pointer size: " ++ @tagName(info.size)),
+                },
                 else => unsupportedType(T),
             };
         }
 
+        /// If there are any relative pointers that need adjustment, perform the adjustment in-place.
+        /// Must be called after all serialization is done, but before writing out.
+        fn fixRelPtrs(self: *Self) void {
+            const value_len = @as(u32, @intCast(self.value.items.len));
+            for (self.unfixed_relptrs.items) |unfixed_rp| {
+                const ptr_bytes = switch (unfixed_rp.location) {
+                    .value => self.value.items[unfixed_rp.offset .. unfixed_rp.offset + 4],
+                    .trailer => self.trailer.items[unfixed_rp.offset .. unfixed_rp.offset + 4],
+                };
+                const trailer_offset = decodeFixed(u32, options.endianness, ptr_bytes);
+                const adjusted = value_len + trailer_offset;
+                encodeFixed(options.endianness, ptr_bytes, adjusted);
+            }
+            self.unfixed_relptrs.clearRetainingCapacity();
+        }
+
         /// Writes the in-memory state of this serializer to a writer.
         /// Doesn't clear or modify anything, can be called multiple times.
-        fn writeTo(self: *const Self, writer: *std.Io.Writer) !void {
+        fn writeTo(self: *Self, writer: *std.Io.Writer) !void {
+            self.fixRelPtrs();
+            assert(self.unfixed_relptrs.items.len == 0); // All adjustments should be done.
             try writer.writeAll(self.value.items);
+            try writer.writeAll(self.trailer.items);
         }
 
         /// Helper function to serialize a value, and immediately write it to a writer.
@@ -140,10 +244,26 @@ pub fn Serializer(comptime options: SerializerOptions) type {
     };
 }
 
-/// Serialized is a view of a serialized type T, e.g. returned from deserialization.
+/// A relative pointer, e.g. pointing to an offset within the same byte buffer. The pointer
+/// can be resolved to a value by following the offset from a base pointer (e.g. the start of the buffer).
+pub fn SerializedPtr(comptime T: type) type {
+    return extern struct {
+        const Self = @This();
+
+        offset: u32,
+
+        pub fn resolve(self: *const Self, base_ptr: [*]const u8) *const SerializedRep(T) {
+            const target_ptr = base_ptr + self.offset;
+
+            return @ptrCast(@alignCast(target_ptr));
+        }
+    };
+}
+
+/// SerializedRep is a view of a serialized type T, e.g. returned from deserialization.
 /// Specifically, for some types, we can't rely on Zig to give us a consistent byte layout
 /// across compiler versions or platforms, so this type implements a consistent layout.
-pub fn Serialized(comptime T: type) type {
+pub fn SerializedRep(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .int, .bool => T, // Trivially represented types; consistent layout.
         .@"enum" => |info| std.math.ByteAlignedInt(info.tag_type),
@@ -154,8 +274,8 @@ pub fn Serialized(comptime T: type) type {
             inline for (info.fields, 0..) |f, i| {
                 fields[i] = .{
                     .name = f.name,
-                    .type = Serialized(f.type),
-                    .alignment = @alignOf(Serialized(f.type)),
+                    .type = SerializedRep(f.type),
+                    .alignment = @alignOf(SerializedRep(f.type)),
                     .default_value_ptr = null,
                     .is_comptime = false,
                 };
@@ -169,43 +289,114 @@ pub fn Serialized(comptime T: type) type {
                 },
             });
         },
+        .pointer => |info| switch (info.size) {
+            .one => SerializedPtr(info.child),
+            else => @compileError("unsupported pointer size: " ++ @tagName(info.size)),
+        },
         else => unsupportedType(T),
     };
 }
 
 /// Returns whether a value is logically equivalent to a serialized view of itself.
-/// The types themselves may differ, e.g. `Serialized(T)` may be a different type than `T`,
+/// The types themselves may differ, e.g. `SerializedRep(T)` may be a different type than `T`,
 /// but checks whether logically they represent the same data.
 ///
 /// Mostly used for testing at the moment.
-fn logicallyEqualToSerialized(value: anytype, serialized: *const Serialized(@TypeOf(value))) bool {
+fn logicallyEqualToSerialized(value: anytype, deserialized: View(@TypeOf(value))) bool {
     const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .int, .bool => return value == serialized.*,
-        .@"enum" => |info| {
+    return switch (@typeInfo(T)) {
+        .int, .bool => value == deserialized.view().*,
+        .@"enum" => |info| blk: {
             const aligned_type = std.math.ByteAlignedInt(info.tag_type);
             const as_byte_aligned: aligned_type = @intCast(@intFromEnum(value));
-            return as_byte_aligned == serialized.*;
+            break :blk as_byte_aligned == deserialized.view().*;
         },
-        .@"struct" => |info| {
+        .@"struct" => |info| blk: {
             inline for (info.fields) |field| {
                 const v_field = @field(value, field.name);
-                const s_field = @field(serialized.*, field.name);
-                if (!logicallyEqualToSerialized(v_field, &s_field)) {
-                    return false;
+                const s_field = deserialized.field(field.name);
+                if (!logicallyEqualToSerialized(v_field, s_field)) {
+                    break :blk false;
                 }
             }
-            return true;
+            break :blk true;
+        },
+        .pointer => |info| switch (info.size) {
+            .one => logicallyEqualToSerialized(value.*, deserialized.deref()),
+            else => @compileError("unsupported pointer size: " ++ @tagName(info.size)),
         },
         else => unsupportedType(T),
-    }
+    };
 }
 
-/// Deserializes a value of type T from a byte buffer. Specifically, returns a pointer to a `Serialized(T)`,
+/// Returns the type associated with a struct field, by name.
+fn structFieldType(comptime S: type, comptime field_name: []const u8) type {
+    return switch (@typeInfo(S)) {
+        .@"struct" => |info| blk: {
+            inline for (info.fields) |field| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    break :blk field.type;
+                }
+            }
+            @compileError("no such field: " ++ field_name);
+        },
+        else => @compileError("not a struct"),
+    };
+}
+
+/// View is an accessor type for a serialized value of type T.
+/// Depending on the type T, the view may provide different methods to access the data,
+/// e.g. pointers will be resolved with `deref()`, structs will have `field()` accessors, etc.
+///
+/// This is one shortcoming of Zig's lack of trait-based accessors, e.g. we can't implement
+/// Deref or Index traits like in Rust, so we have to rely on methods on compile-time generated types.
+/// TODO maybe some way to clean this up and make it more ergonomic?
+fn View(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |info| switch (info.size) {
+            .one => struct {
+                value: *const SerializedPtr(info.child),
+                base_ptr: [*]const u8,
+
+                fn deref(self: @This()) View(info.child) {
+                    return .{
+                        .value = self.value.resolve(self.base_ptr),
+                        .base_ptr = self.base_ptr,
+                    };
+                }
+            },
+            else => @compileError("unsupported pointer size: " ++ @tagName(info.size)),
+        },
+        .@"struct" => struct {
+            value: *const SerializedRep(T),
+            base_ptr: [*]const u8,
+
+            fn field(self: @This(), comptime name: []const u8) View(structFieldType(T, name)) {
+                return .{
+                    .value = &@field(self.value, name),
+                    .base_ptr = self.base_ptr,
+                };
+            }
+        },
+        else => struct {
+            value: *const SerializedRep(T),
+            base_ptr: [*]const u8,
+
+            fn view(self: @This()) *const SerializedRep(T) {
+                return self.value;
+            }
+        },
+    };
+}
+
+/// Deserializes a value of type T from a byte buffer. Specifically, returns a pointer to a `SerializedRep(T)`,
 /// aka a logically equivalent view of T. The lifetime of the returned pointer is tied to the lifetime of the
 /// provided buffer, e.g. the buffer must outlive the returned pointer.
-pub fn deserialize(comptime T: type, serialized: []const u8) *const Serialized(T) {
-    return @ptrCast(@alignCast(serialized.ptr));
+pub fn deserialize(comptime T: type, serialized: []const u8) View(T) {
+    return .{
+        .value = @ptrCast(@alignCast(serialized.ptr)),
+        .base_ptr = serialized.ptr,
+    };
 }
 
 /// Encodes a fixed-width integer type into a byte buffer, in the specified endianness.
@@ -379,6 +570,70 @@ test "structs" {
 
         const written = try serializer.serializeTo(&alloc_writer.writer, val);
         try testing.expectEqual(expected_size, written.to_value);
+
+        const deserialized = deserialize(@TypeOf(val), alloc_writer.written());
+        try testing.expect(logicallyEqualToSerialized(val, deserialized));
+    }
+}
+
+// Pointers are decently complex, since they rely on writing to the trailer section and storing a
+// relative pointer in the value section. Specifically, the actual encoded value is just a u32-offset
+// into the trailing bytes of the slice, where the actual data is stored.
+test "pointers" {
+    const allocator = testing.allocator;
+
+    var serializer = Serializer(.{}).init(allocator);
+    defer serializer.deinit();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+    defer alloc_writer.deinit();
+
+    const experiments = &.{
+        .{ &@as(u8, 123), &[_]u8{ 4, 0, 0, 0, 0x7b } },
+        .{ &struct { a: u8 }{ .a = 45 }, &[_]u8{ 4, 0, 0, 0, 45 } },
+        .{
+            struct {
+                a: *const u8,
+                b: *const u8,
+            }{
+                .a = &1,
+                .b = &2,
+            },
+            &[_]u8{
+                0x08, 0x00, 0x00, 0x00, // offset to a
+                0x09, 0x00, 0x00, 0x00, // offset to b
+                0x01, // a value (e.g. within trailer)
+                0x02, // b value (e.g. within trailer)
+            },
+        },
+        .{
+            &struct {
+                a: *const u8,
+                b: *const u8,
+            }{
+                .a = &0x69,
+                .b = &0x42,
+            },
+            &[_]u8{
+                0x08, 0x00, 0x00, 0x00, // rel ptr (outer struct)
+                // trailer start
+                0x69, // value of a
+                0x42, // value of b
+                0x00, 0x00, // padding for alignment (e.g. outer struct 4-byte aligned)
+                0x04, 0x00, 0x00, 0x00, // rel ptr (a)
+                0x05, 0x00, 0x00, 0x00, // rel ptr (b)
+            },
+        },
+    };
+    inline for (experiments) |exp| {
+        defer alloc_writer.clearRetainingCapacity();
+
+        const val = exp.@"0";
+        const expected_bytes = exp.@"1";
+
+        const written = try serializer.serializeTo(&alloc_writer.writer, val);
+        try testing.expectEqualSlices(u8, expected_bytes, alloc_writer.written());
+        try testing.expectEqual(expected_bytes.len, written.total());
 
         const deserialized = deserialize(@TypeOf(val), alloc_writer.written());
         try testing.expect(logicallyEqualToSerialized(val, deserialized));
