@@ -9,7 +9,7 @@ on:
       - .github/workflows/*
 jobs:
   test:
-    runs-on: ubuntu
+    runs-on: ubuntu-latest
     name: Build and Test
     steps:
       - uses: actions/checkout@v4
