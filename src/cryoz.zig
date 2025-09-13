@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+const testing = std.testing;
 const assert = std.debug.assert;
 
 /// Options for controlling serialization behavior.
@@ -261,7 +263,7 @@ test "comptime type fixed encoding/decoding" {
         inline for (&[_]std.builtin.Endian{ .little, .big }) |ord| {
             encodeFixed(ord, &buf, value);
             const decoded = decodeFixed(typ, ord, &buf);
-            try std.testing.expectEqual(value, decoded);
+            try testing.expectEqual(value, decoded);
         }
     }
 }
@@ -269,7 +271,7 @@ test "comptime type fixed encoding/decoding" {
 // Integers are pretty trivial; just read/write them in the compile-time defined endianness.
 // Zig will natively represent them in the target's endianness.
 test "zerocopy: integers" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
     defer serializer.deinit();
@@ -289,17 +291,17 @@ test "zerocopy: integers" {
         for (experiments) |value| {
             defer alloc_writer.clearRetainingCapacity();
             const written = try serializer.serializeTo(&alloc_writer.writer, value);
-            try std.testing.expectEqual(@sizeOf(T), written.to_value);
+            try testing.expectEqual(@sizeOf(T), written.to_value);
 
             const deserialized = deserialize(T, alloc_writer.written());
-            try std.testing.expect(logicallyEqualToSerialized(value, deserialized));
+            try testing.expect(logicallyEqualToSerialized(value, deserialized));
         }
     }
 }
 
 // Booleans are just a single byte, 0 or 1.
 test "zerocopy: booleans" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
     defer serializer.deinit();
@@ -311,17 +313,17 @@ test "zerocopy: booleans" {
     for (experiments) |value| {
         defer alloc_writer.clearRetainingCapacity();
         const written = try serializer.serializeTo(&alloc_writer.writer, value);
-        try std.testing.expectEqual(1, written.to_value);
+        try testing.expectEqual(1, written.to_value);
 
         const deserialized = deserialize(bool, alloc_writer.written());
-        try std.testing.expect(logicallyEqualToSerialized(value, deserialized));
+        try testing.expect(logicallyEqualToSerialized(value, deserialized));
     }
 }
 
 // Enums are simple wrappers around integers. For enums that aren't byte aligned (e.g. u3), we'll
 // store them as the next largest byte-aligned integer (e.g. u8).
 test "zerocopy: enums" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
     defer serializer.deinit();
@@ -343,17 +345,17 @@ test "zerocopy: enums" {
     inline for (experiments) |value| {
         defer alloc_writer.clearRetainingCapacity();
         const written = try serializer.serializeTo(&alloc_writer.writer, value);
-        try std.testing.expectEqual(@sizeOf(@TypeOf(value)), written.to_value);
+        try testing.expectEqual(@sizeOf(@TypeOf(value)), written.to_value);
 
         const deserialized = deserialize(@TypeOf(value), alloc_writer.written());
-        try std.testing.expect(logicallyEqualToSerialized(value, deserialized));
+        try testing.expect(logicallyEqualToSerialized(value, deserialized));
     }
 }
 
 // Structs are a bit more interesting, since they're composed of multiple fields, and we need to
 // ensure proper alignment / padding between fields.
 test "zerocopy: struct" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
     defer serializer.deinit();
@@ -376,9 +378,9 @@ test "zerocopy: struct" {
         const expected_size = exp.@"1";
 
         const written = try serializer.serializeTo(&alloc_writer.writer, val);
-        try std.testing.expectEqual(expected_size, written.to_value);
+        try testing.expectEqual(expected_size, written.to_value);
 
         const deserialized = deserialize(@TypeOf(val), alloc_writer.written());
-        try std.testing.expect(logicallyEqualToSerialized(val, deserialized));
+        try testing.expect(logicallyEqualToSerialized(val, deserialized));
     }
 }

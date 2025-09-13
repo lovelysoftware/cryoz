@@ -1,0 +1,17 @@
+name: zig build test
+on:
+  push:
+    branches: ["trunk"]
+    paths:
+      - build.zig
+      - build.zig.zon
+      - src/**
+      - .github/workflows/*
+jobs:
+  test:
+    runs-on: ubuntu
+    name: Build and Test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+      - run: zig build test
