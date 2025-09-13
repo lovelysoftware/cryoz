@@ -1,5 +1,7 @@
 __Cryoz__ implements fast, zero-copy deserialization of Zig types. Specifically, it serializes types such that they can be trivially re-interpreted as the original type (ish) without any in-memory copies or transformations.
 
+Currently _alpha_ quality, not recommended for production use.
+
 In cryoz, the deserialization function is simple one-liner:
 
 ```zig
