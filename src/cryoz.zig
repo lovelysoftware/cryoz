@@ -270,7 +270,7 @@ test "comptime type fixed encoding/decoding" {
 
 // Integers are pretty trivial; just read/write them in the compile-time defined endianness.
 // Zig will natively represent them in the target's endianness.
-test "zerocopy: integers" {
+test "integers" {
     const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
@@ -300,7 +300,7 @@ test "zerocopy: integers" {
 }
 
 // Booleans are just a single byte, 0 or 1.
-test "zerocopy: booleans" {
+test "booleans" {
     const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
@@ -322,7 +322,7 @@ test "zerocopy: booleans" {
 
 // Enums are simple wrappers around integers. For enums that aren't byte aligned (e.g. u3), we'll
 // store them as the next largest byte-aligned integer (e.g. u8).
-test "zerocopy: enums" {
+test "enums" {
     const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
@@ -354,7 +354,7 @@ test "zerocopy: enums" {
 
 // Structs are a bit more interesting, since they're composed of multiple fields, and we need to
 // ensure proper alignment / padding between fields.
-test "zerocopy: struct" {
+test "structs" {
     const allocator = testing.allocator;
 
     var serializer = Serializer(.{}).init(allocator);
