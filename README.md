@@ -14,3 +14,24 @@ pub fn deserialize(comptime T: type, data: []const u8) !*const SerializedRep(T) 
 (In practice, it's a little more than this, aka we need to properly resolve relative pointers, etc.)
 
 This library heavily exploits compile-time metaprogramming in Zig. It was heavily inspired by [rkyv](https://rkyv.org/), which implements zero-copy deserialization in Rust. When [turbopuffer](https://turbopuffer.com) switched from bincode to rkyv, we saw a [65% reduction in CPU consumption from queries and a noticable latency improvement](https://x.com/pushrax/status/1799156380059967856).
+
+### Remaining work
+
+(PRs welcome!)
+
+Types to support:
+- [ ] Floating point types
+- [ ] Arrays
+- [ ] Slices
+- [ ] Comptime types (e.g. comptime_int, comptime_float, likely trivial)
+- [ ] Unions (+ tagged unions)
+- [ ] Optionals
+- [ ] Error sets and unions
+
+Misc:
+- [ ] Seperate into multiple files, organize things a bit better
+- [ ] Clean up View type, maybe make it more ergonomic?
+- [ ] Better README, documentation
+- [ ] Optimized optional type (e.g. ?*T can be cleaner)
+- [ ] Performance benchmarks (serialize/deserialize speed, size of serialized data, etc)
+- [ ] Blog post
