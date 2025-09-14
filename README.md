@@ -23,7 +23,6 @@ Types to support:
 - [ ] Floating point types
 - [ ] Arrays
 - [ ] Slices
-- [ ] Comptime types (e.g. comptime_int, comptime_float, likely trivial)
 - [ ] Unions (+ tagged unions)
 - [ ] Optionals
 - [ ] Error sets and unions
