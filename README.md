@@ -20,12 +20,14 @@ This library heavily exploits compile-time metaprogramming in Zig. It was heavil
 (PRs welcome!)
 
 Types to support:
-- [ ] Floating point types
 - [ ] Arrays
 - [ ] Slices
 - [ ] Unions (+ tagged unions)
 - [ ] Optionals
 - [ ] Error sets and unions
+- [ ] Packed structs?
+- [ ] f80 (IEEE-754-2008 80-bit extended precision)
+- [ ] C types (e.g. c_longdouble)
 
 Misc:
 - [ ] Seperate into multiple files, organize things a bit better

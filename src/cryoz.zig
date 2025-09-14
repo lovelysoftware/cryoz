@@ -111,6 +111,15 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                     try self.value.appendSlice(self.alloc, &buf);
                     break :blk .{ .to_value = buf.len, .to_trailer = 0 };
                 },
+                .float => |info| blk: {
+                    switch (info.bits) {
+                        16, 32, 64, 128 => {},
+                        80 => @compileError("todo: support 80-bit floats"),
+                        else => @compileError("unsupported float size: " ++ @tagName(info.bits)),
+                    }
+                    const unsigned_val: unsignedIntType(info.bits) = @bitCast(value);
+                    break :blk self.serialize(unsigned_val);
+                },
                 .bool => blk: {
                     const byte: u8 = if (value) 1 else 0;
                     try self.value.append(self.alloc, byte);
@@ -245,6 +254,13 @@ pub fn Serializer(comptime options: SerializerOptions) type {
     };
 }
 
+/// Returns a unsigned integer type that can hold the given number of bits.
+fn unsignedIntType(comptime bits: u16) type {
+    return @Type(.{
+        .int = .{ .bits = bits, .signedness = .unsigned },
+    });
+}
+
 /// A relative pointer, e.g. pointing to an offset within the same byte buffer. The pointer
 /// can be resolved to a value by following the offset from a base pointer (e.g. the start of the buffer).
 pub fn SerializedPtr(comptime T: type) type {
@@ -268,6 +284,14 @@ pub fn SerializedRep(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .void, .bool => T, // Trivially represented types; consistent layout.
         .int => std.math.ByteAlignedInt(T),
+        .float => |info| blk: {
+            switch (info.bits) {
+                16, 32, 64, 128 => {},
+                80 => @compileError("todo: support 80-bit floats"),
+                else => @compileError("unsupported float size: " ++ @tagName(info.bits)),
+            }
+            break :blk T;
+        },
         .@"enum" => |info| SerializedRep(info.tag_type),
         .@"struct" => |info| blk: {
             // The serialized view of a struct is simply a struct, where all the fields have
@@ -308,6 +332,17 @@ fn logicallyEqualToSerialized(value: anytype, deserialized: View(@TypeOf(value))
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .int, .bool => value == deserialized.view().*,
+        .float => blk: {
+            if (std.math.isNan(value)) {
+                break :blk std.math.isNan(deserialized.view().*);
+            }
+            break :blk std.math.approxEqRel(
+                T,
+                value,
+                deserialized.view().*,
+                std.math.floatEps(T),
+            );
+        },
         .@"enum" => |info| blk: {
             const aligned_type = std.math.ByteAlignedInt(info.tag_type);
             const as_byte_aligned: aligned_type = @intCast(@intFromEnum(value));
@@ -509,6 +544,7 @@ test "integers" {
     }
 }
 
+// Non-byte aligned integers are represented as the next largest byte-aligned integer.
 test "non-byte aligned integers" {
     const allocator = testing.allocator;
 
@@ -524,6 +560,40 @@ test "non-byte aligned integers" {
 
     const deserialized = deserialize(u3, alloc_writer.written());
     try testing.expect(logicallyEqualToSerialized(value, deserialized));
+}
+
+// Floating points are supported, since Zig guarantees their layout is consistent across platforms.
+test "floats" {
+    const allocator = testing.allocator;
+
+    var serializer = Serializer(.{}).init(allocator);
+    defer serializer.deinit();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+    defer alloc_writer.deinit();
+
+    const types = [_]type{ f16, f32, f64, f128 };
+    inline for (types) |T| {
+        const experiments = [_]T{
+            -1.0,
+            0.0,
+            1.0,
+            3.14159,
+            -3.14159,
+            std.math.floatMax(T),
+            std.math.floatMin(T),
+            std.math.floatEps(T),
+            std.math.nan(T),
+        };
+        for (experiments) |value| {
+            defer alloc_writer.clearRetainingCapacity();
+            const written = try serializer.serializeTo(&alloc_writer.writer, value);
+            try testing.expectEqual(@sizeOf(T), written.to_value);
+
+            const deserialized = deserialize(T, alloc_writer.written());
+            try testing.expect(logicallyEqualToSerialized(value, deserialized));
+        }
+    }
 }
 
 // Booleans are just a single byte, 0 or 1.
