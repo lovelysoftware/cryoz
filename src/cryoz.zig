@@ -105,8 +105,9 @@ pub fn Serializer(comptime options: SerializerOptions) type {
             return switch (@typeInfo(T)) {
                 .void => .{},
                 .int => blk: {
-                    var buf: [@sizeOf(T)]u8 = undefined;
-                    encodeFixed(options.endianness, &buf, value);
+                    const aligned_type = std.math.ByteAlignedInt(T);
+                    var buf: [@sizeOf(aligned_type)]u8 = undefined;
+                    encodeFixed(options.endianness, &buf, @as(aligned_type, @intCast(value)));
                     try self.value.appendSlice(self.alloc, &buf);
                     break :blk .{ .to_value = buf.len, .to_trailer = 0 };
                 },
@@ -116,8 +117,7 @@ pub fn Serializer(comptime options: SerializerOptions) type {
                     break :blk .{ .to_value = 1, .to_trailer = 0 };
                 },
                 .@"enum" => |info| blk: {
-                    const aligned_type = std.math.ByteAlignedInt(info.tag_type);
-                    const tag: aligned_type = @intCast(@intFromEnum(value));
+                    const tag: info.tag_type = @intCast(@intFromEnum(value));
                     break :blk self.serialize(tag);
                 },
                 .@"struct" => |info| blk: {
@@ -266,8 +266,9 @@ pub fn SerializedPtr(comptime T: type) type {
 /// across compiler versions or platforms, so this type implements a consistent layout.
 pub fn SerializedRep(comptime T: type) type {
     return switch (@typeInfo(T)) {
-        .void, .int, .bool => T, // Trivially represented types; consistent layout.
-        .@"enum" => |info| std.math.ByteAlignedInt(info.tag_type),
+        .void, .bool => T, // Trivially represented types; consistent layout.
+        .int => std.math.ByteAlignedInt(T),
+        .@"enum" => |info| SerializedRep(info.tag_type),
         .@"struct" => |info| blk: {
             // The serialized view of a struct is simply a struct, where all the fields have
             // been transformed into their Serialized view.
@@ -506,6 +507,23 @@ test "integers" {
             try testing.expect(logicallyEqualToSerialized(value, deserialized));
         }
     }
+}
+
+test "non-byte aligned integers" {
+    const allocator = testing.allocator;
+
+    var serializer = Serializer(.{}).init(allocator);
+    defer serializer.deinit();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+    defer alloc_writer.deinit();
+
+    const value = @as(u3, 5);
+    const written = try serializer.serializeTo(&alloc_writer.writer, value);
+    try testing.expectEqual(1, written.total());
+
+    const deserialized = deserialize(u3, alloc_writer.written());
+    try testing.expect(logicallyEqualToSerialized(value, deserialized));
 }
 
 // Booleans are just a single byte, 0 or 1.
