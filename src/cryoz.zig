@@ -103,6 +103,7 @@ pub fn Serializer(comptime options: SerializerOptions) type {
         fn serialize(self: *Self, value: anytype) !Written {
             const T = @TypeOf(value);
             return switch (@typeInfo(T)) {
+                .void => .{},
                 .int => blk: {
                     var buf: [@sizeOf(T)]u8 = undefined;
                     encodeFixed(options.endianness, &buf, value);
@@ -265,7 +266,7 @@ pub fn SerializedPtr(comptime T: type) type {
 /// across compiler versions or platforms, so this type implements a consistent layout.
 pub fn SerializedRep(comptime T: type) type {
     return switch (@typeInfo(T)) {
-        .int, .bool => T, // Trivially represented types; consistent layout.
+        .void, .int, .bool => T, // Trivially represented types; consistent layout.
         .@"enum" => |info| std.math.ByteAlignedInt(info.tag_type),
         .@"struct" => |info| blk: {
             // The serialized view of a struct is simply a struct, where all the fields have
@@ -457,6 +458,23 @@ test "comptime type fixed encoding/decoding" {
             try testing.expectEqual(value, decoded);
         }
     }
+}
+
+// Void is the most basic type, it's a no-op.
+test "void" {
+    const allocator = testing.allocator;
+
+    var serializer = Serializer(.{}).init(allocator);
+    defer serializer.deinit();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(allocator);
+    defer alloc_writer.deinit();
+
+    const written = try serializer.serializeTo(&alloc_writer.writer, @as(void, {}));
+    try testing.expectEqual(0, written.to_value);
+
+    const deserialized = deserialize(void, alloc_writer.written());
+    try testing.expectEqual(@as(void, {}), deserialized.view().*);
 }
 
 // Integers are pretty trivial; just read/write them in the compile-time defined endianness.
